@@ -1,0 +1,1474 @@
+import React, { useState, useCallback, useMemo, useRef, useEffect, forwardRef } from 'react'
+import { PlasmicProjectEstimator, DefaultProjectEstimatorProps } from './plasmic/hypernova_inc/PlasmicProjectEstimator'
+import { HTMLElementRefOf } from '@plasmicapp/react-web'
+import { useRouter } from 'next/router'
+import { client } from '../src/utils/api-client'
+import { createProject, createLead } from '../src/graphql/mutations'
+import { getProject } from '../src/graphql/queries'
+import { onUpdateProject } from '../src/graphql/subscriptions'
+import GanttChart from './GanttChart'
+import FieldError from './FieldError'
+import EstimateStatusBanner, { type AiStatus } from './EstimateStatusBanner'
+import EstimateShareBar, { EstimateNotFound } from './EstimateShareBar'
+import EstimatorProgress, { WIZARD_STEPS, type WizardStep } from './EstimatorProgress'
+import { toast, ToastContainer } from 'react-toastify'
+import 'react-toastify/dist/ReactToastify.css'
+import { env } from '../src/utils/env'
+import {
+  HOURS_PER_PERSON_PER_MONTH,
+  parseTimelineToMonths,
+  getTeamComposition,
+  computeDefaultEstimate,
+  getTimelineRangeInMonths,
+  formatMonthsRange,
+  formatTeamSize,
+  formatInfrastructure,
+} from '../lib/estimatorMath'
+import {
+  extractPhasesJsonFromText,
+  removePhasesJsonFromText,
+  extractTeamSummary,
+  extractTeamCompositionDetails,
+  extractInfrastructureSummary,
+  extractCostSummary,
+  extractTimelineSummary,
+} from '../lib/aiTextParsing'
+import { logger, describeError } from '../lib/logger'
+
+const TOAST_OPTIONS = {
+  position: 'bottom-right' as const,
+  autoClose: 5000,
+  hideProgressBar: false,
+  closeOnClick: true,
+  pauseOnHover: true,
+  draggable: true,
+  theme: 'dark' as const,
+}
+
+interface ProjectData {
+  id?: string
+  teamSize?: string | null
+  AI_teamSize?: string | null
+  AI_estimatedCost?: string | null
+  AI_estimatedTimeline?: string | null
+  timeline?: string | null
+  scope?: string | null
+  infrastructure?: string | null
+  AI_improvedScope?: string | null
+  AI_costAnalysis?: string | null
+  AI_summary?: string | null
+  AI_timelineValidation?: string | null
+  AI_timeline?: string | null
+  AI_infrastructure?: string | null
+  AI_infrastructureRecommendations?: string | null
+  AI_riskAssessment?: string | null
+}
+
+interface GraphQLResponse {
+  data?: {
+    getProject?: ProjectData
+  }
+}
+
+interface SubscriptionMessage {
+  data?: {
+    onUpdateProject?: ProjectData
+  }
+}
+
+interface FormEvent {
+  target: {
+    value: string
+  }
+}
+
+interface FormState {
+  scope: string
+  timeline: string
+  selectedTeam: string
+  infrastructure: string
+  firstName: string
+  lastName: string
+  emailAddress: string
+  phoneNumber: string
+  message: string
+}
+
+const createInitialFormState = (): FormState => ({
+  scope: '',
+  timeline: '',
+  selectedTeam: '',
+  infrastructure: '',
+  firstName: '',
+  lastName: '',
+  emailAddress: '',
+  phoneNumber: '',
+  message: '',
+})
+
+export interface ProjectEstimatorProps extends DefaultProjectEstimatorProps {}
+
+function ProjectEstimator_(props: ProjectEstimatorProps, ref: HTMLElementRefOf<'div'>) {
+  type StepType = 'start' | 'scope' | 'timeline' | 'team' | 'infrastructure' | 'loading' | 'summary'
+
+  // Form state management
+  const [step, setStep] = useState<StepType>('start')
+  const [formState, setFormState] = useState<FormState>(() => createInitialFormState())
+
+  // State for AI-generated estimates
+  const [aiEstimate, setAiEstimate] = useState<string | null>(null)
+  const [aiTimeline, setAiTimeline] = useState<string | null>(null)
+  const [aiPhasesJson, setAiPhasesJson] = useState<string | null>(null)
+  const [aiTeamSize, setAiTeamSize] = useState<string | null>(null)
+  const [aiImprovedScope, setAiImprovedScope] = useState<string | null>(null)
+  const [aiCostAnalysis, setAiCostAnalysis] = useState<string | null>(null)
+  const [aiTimelineValidationRaw, setAiTimelineValidationRaw] = useState<string | null>(null)
+  const [aiInfrastructure, setAiInfrastructure] = useState<string | null>(null)
+  const [aiInfrastructureRecommendations, setAiInfrastructureRecommendations] = useState<string | null>(null)
+  const [aiRiskAssessment, setAiRiskAssessment] = useState<string | null>(null)
+  const subscriptionRef = useRef<{ unsubscribe: () => void } | null>(null)
+  const [lastProjectId, setLastProjectId] = useState<string | null>(null)
+  const contactFormTrackedFields = useRef<Set<string>>(new Set())
+  const estimatorRenderedAt = useRef<number>(Date.now())
+  const [autoSelections, setAutoSelections] = useState({
+    timeline: false,
+    team: false,
+    infrastructure: false,
+  })
+
+  // Per-step validation messages. Replaces six window.alert() calls: a native
+  // dialog is unstyled, untranslatable, invisible to analytics, and announced
+  // with no association to the field it is complaining about.
+  const [stepErrors, setStepErrors] = useState<Partial<Record<StepType, string>>>({})
+
+  // Whether the AI analysis actually arrived.
+  //
+  // This replaces a local `let aiDataReceived = false` captured inside
+  // handleProjectSubmit. That variable belonged to one invocation of one
+  // callback: the summary refresher could not see it, and neither could the
+  // render. Which meant the one thing the UI most needed to know -- are these
+  // real figures or our fallback arithmetic? -- was invisible to it.
+  const [aiStatus, setAiStatus] = useState<AiStatus>('pending')
+
+  // HN-01: an estimate restored from a shared link that could not be found.
+  const [restoreFailed, setRestoreFailed] = useState(false)
+
+  // Furthest step the visitor has reached. Progress labels are clickable up to
+  // here and disabled beyond it, so nobody can skip a question by clicking
+  // ahead -- the validation in handleNext is still the only way forward.
+  const [maxStepReached, setMaxStepReached] = useState<WizardStep>('scope')
+  const [isPreparingPdf, setIsPreparingPdf] = useState(false)
+
+  // HN-02: opt-in, defaulted ON. The visitor has just asked for an estimate,
+  // so a copy of it is the thing they came for rather than marketing they
+  // must be tricked into. It is still a real checkbox they can clear.
+  const [emailCopy, setEmailCopy] = useState(true)
+  const router = useRouter()
+
+  /**
+   * Copies a Project record onto component state.
+   *
+   * This logic existed in four places: the subscription handler, the immediate
+   * fetch, the fallback poller and the summary refresher. They had already
+   * drifted -- the refresher never handled AI_infrastructureRecommendations, so
+   * a late-arriving recommendation was silently dropped on that path alone.
+   *
+   * HN-01 needs a fifth caller (restoring an estimate from a link), which made
+   * consolidating this the prerequisite rather than an optional tidy-up.
+   *
+   * Returns true when the record carries a real AI analysis, so callers can
+   * decide whether to advance the wizard.
+   */
+  const applyProjectToState = useCallback((project?: ProjectData | null): boolean => {
+    if (!project) return false
+
+    if (project.AI_estimatedCost) setAiEstimate(project.AI_estimatedCost)
+    if (project.AI_estimatedTimeline) setAiTimeline(project.AI_estimatedTimeline)
+    if (project.AI_teamSize) setAiTeamSize(project.AI_teamSize)
+    if (project.AI_improvedScope) setAiImprovedScope(project.AI_improvedScope)
+    if (project.AI_costAnalysis) setAiCostAnalysis(project.AI_costAnalysis)
+    if (project.AI_infrastructure) setAiInfrastructure(project.AI_infrastructure)
+    if (project.AI_infrastructureRecommendations)
+      setAiInfrastructureRecommendations(project.AI_infrastructureRecommendations)
+    if (project.AI_riskAssessment) setAiRiskAssessment(project.AI_riskAssessment)
+
+    if (project.scope) setFormState((prev) => ({ ...prev, scope: project.scope || '' }))
+
+    // A concrete value from the worker overrides "Recommend for me": the
+    // recommendation has now been made, so the checkbox should stop claiming
+    // it is pending.
+    if (project.teamSize) {
+      setAutoSelections((prev) => (prev.team ? { ...prev, team: false } : prev))
+      setFormState((prev) => ({ ...prev, selectedTeam: project.teamSize || '' }))
+    }
+    if (project.infrastructure) {
+      setAutoSelections((prev) => (prev.infrastructure ? { ...prev, infrastructure: false } : prev))
+      setFormState((prev) => ({ ...prev, infrastructure: project.infrastructure || '' }))
+    }
+
+    // Phase data arrives in one of two shapes depending on which prompt ran.
+    if (project.AI_timelineValidation) {
+      const phases = extractPhasesJsonFromText(project.AI_timelineValidation)
+      if (phases) setAiPhasesJson(phases)
+      setAiTimelineValidationRaw(project.AI_timelineValidation)
+    }
+    if (project.AI_timeline) {
+      try {
+        const parsed = JSON.parse(project.AI_timeline)
+        if (parsed && parsed.phases) setAiPhasesJson(project.AI_timeline)
+      } catch {
+        // AI_timeline is not always JSON; the text path above covers it.
+      }
+    }
+
+    return Boolean(project.AI_costAnalysis || project.AI_summary || project.AI_estimatedCost)
+  }, [])
+
+  const failStep = useCallback((stepName: StepType, message: string) => {
+    setStepErrors((prev) => ({ ...prev, [stepName]: message }))
+    window.dataLayer?.push({
+      event: 'estimator_validation_error',
+      env,
+      app_env: env,
+      step: stepName,
+    })
+  }, [])
+
+  const clearStepError = useCallback((stepName: StepType) => {
+    setStepErrors((prev) => (prev[stepName] ? { ...prev, [stepName]: undefined } : prev))
+  }, [])
+
+  // Unified estimate: align hours with timeline (AI if present) and cost with AI when available
+  const currentEstimate = useMemo(() => {
+    const monthsForHours = parseTimelineToMonths(aiTimeline || formState.timeline)
+    const roles = getTeamComposition(formState.selectedTeam)
+    let totalHours = 0
+    if (roles) {
+      Object.entries(roles).forEach(([, count]) => {
+        totalHours += (count as number) * monthsForHours * HOURS_PER_PERSON_PER_MONTH
+      })
+    }
+    const hoursRange = totalHours ? `${Math.round(totalHours * 0.85)}-${Math.round(totalHours * 1.15)}` : 'TBD'
+
+    if (aiEstimate) {
+      return { hours: hoursRange, cost: aiEstimate }
+    }
+    const baseline = computeDefaultEstimate(formState.selectedTeam, formState.timeline)
+    return { hours: hoursRange, cost: baseline.cost }
+  }, [formState.selectedTeam, formState.timeline, aiEstimate, aiTimeline])
+
+  // State update handler
+  const updateFormField = useCallback(
+    (field: keyof FormState, value: string) => {
+      // Clear on change rather than on the next submit attempt, so the message
+      // disappears the moment the visitor addresses it.
+      if (field === 'scope') clearStepError('scope')
+      if (field === 'timeline') clearStepError('timeline')
+      if (field === 'selectedTeam') clearStepError('team')
+      if (field === 'infrastructure') clearStepError('infrastructure')
+      logger.debug('[estimator] Updating form field:', { field, value })
+      setAutoSelections((prev) => {
+        if (field === 'timeline' && prev.timeline) {
+          return { ...prev, timeline: false }
+        }
+        if (field === 'selectedTeam' && prev.team) {
+          return { ...prev, team: false }
+        }
+        if (field === 'infrastructure' && prev.infrastructure) {
+          return { ...prev, infrastructure: false }
+        }
+        return prev
+      })
+      setFormState((prev) => ({
+        ...prev,
+        [field]: value,
+      }))
+    },
+    [clearStepError]
+  )
+
+  const handleRecommendationToggle = useCallback(
+    (key: 'timeline' | 'team' | 'infrastructure', value: boolean) => {
+      if (value) clearStepError(key)
+      setAutoSelections((prev) => {
+        if (prev[key] === value) return prev
+        return { ...prev, [key]: value }
+      })
+
+      if (value) {
+        if (key === 'timeline') {
+          setFormState((prev) => ({ ...prev, timeline: '' }))
+        } else if (key === 'team') {
+          setFormState((prev) => ({ ...prev, selectedTeam: '' }))
+        } else if (key === 'infrastructure') {
+          setFormState((prev) => ({ ...prev, infrastructure: '' }))
+        }
+      }
+    },
+    [clearStepError]
+  )
+
+  const handleProjectSubmit = useCallback(async () => {
+    if (step !== 'infrastructure') {
+      logger.debug('[estimator] Not on infrastructure step yet')
+      return
+    }
+
+    // Flag to track if AI data has been received
+    let aiDataReceived = false
+
+    try {
+      logger.debug('[estimator] submitting project')
+      // Basic validation to avoid empty strings hitting DynamoDB
+      const hasTimeline = autoSelections.timeline || !!formState.timeline.trim()
+      const hasTeam = autoSelections.team || !!formState.selectedTeam
+      const hasInfrastructure = autoSelections.infrastructure || !!formState.infrastructure
+
+      if (!formState.scope || !hasTimeline || !hasTeam || !hasInfrastructure) {
+        toast.error('Please complete all steps before submitting the project.', TOAST_OPTIONS)
+        return
+      }
+
+      const timelineValue = autoSelections.timeline ? 'Recommend for me' : formState.timeline
+      const teamValue = autoSelections.team ? 'Recommend for me' : formState.selectedTeam
+      const infrastructureValue = autoSelections.infrastructure ? 'Recommend for me' : formState.infrastructure
+      const summaryTeam = autoSelections.team ? 'a recommended team' : formState.selectedTeam || 'TBD'
+      const summaryInfrastructure = autoSelections.infrastructure
+        ? 'recommended infrastructure'
+        : formState.infrastructure || 'TBD'
+
+      const initialProjectData = {
+        scope: formState.scope,
+        timeline: timelineValue,
+        teamSize: teamValue,
+        infrastructure: infrastructureValue,
+        cost: currentEstimate.cost,
+        summary: `Project for ${summaryTeam} with ${summaryInfrastructure}`,
+      } as const
+
+      // Remove empty string fields to keep AppSync/Dynamo happy
+      const projectData = Object.fromEntries(Object.entries(initialProjectData).filter(([, v]) => v !== ''))
+
+      const result = await client
+        .graphql({
+          query: createProject,
+          variables: { input: projectData },
+        })
+        .catch((error) => {
+          if (error.message?.includes('Unauthorized') || error.statusCode === 401) {
+            throw new Error('Authentication failed. Please try again or contact support.')
+          }
+          throw error
+        })
+
+      const projectId = result.data.createProject.id
+      logger.debug('[estimator] project created', projectId)
+      setLastProjectId(projectId)
+
+      // Show loading screen while AI processes the project
+      setStep('loading')
+
+      // Subscribe for real-time AI updates for this project
+      try {
+        if (subscriptionRef.current) {
+          subscriptionRef.current.unsubscribe()
+        }
+        // Filter server-side, on the id we just created.
+        //
+        // Without `variables`, AppSync pushes EVERY project update to EVERY
+        // connected client, and the check below quietly discarded the ones
+        // that did not match. That meant each visitor's browser received every
+        // other visitor's scope text, cost analysis and risk assessment over
+        // the websocket. The client-side `if` was hiding a data leak, not
+        // preventing one.
+        //
+        // The generated subscription already accepted
+        // `$filter: ModelSubscriptionProjectFilterInput` -- it was simply
+        // never passed. The client-side check stays as defence in depth: a
+        // filter is a server we are trusting, and trusting one server is
+        // enough reason to keep a cheap local assertion.
+        const sub = client
+          .graphql({
+            query: onUpdateProject,
+            variables: { filter: { id: { eq: projectId } } },
+          })
+          .subscribe({
+            next: ({ data }: SubscriptionMessage) => {
+              const updated = data?.onUpdateProject
+              if (!updated || updated.id !== projectId) return
+              logger.debug('[estimator] subscription update received')
+              const hasAi = applyProjectToState(updated)
+
+              if (hasAi) {
+                logger.debug('[estimator] AI data received via subscription')
+                aiDataReceived = true
+                setAiStatus('ready')
+                setStep('summary')
+              }
+            },
+            error: (err: Error) => logger.error('[estimator] Subscription error:', err),
+          })
+        subscriptionRef.current = sub as unknown as { unsubscribe: () => void }
+
+        // Immediate fetch to avoid races where updates land before subscription is ready
+        try {
+          const immediate = await client.graphql({
+            query: getProject,
+            variables: { id: projectId },
+          })
+          const p = (immediate as GraphQLResponse)?.data?.getProject
+          const hasImmediateAi = applyProjectToState(p)
+
+          if (hasImmediateAi) {
+            logger.debug('[estimator] AI data already available on immediate fetch')
+            aiDataReceived = true
+            setAiStatus('ready')
+            setStep('summary')
+          }
+        } catch {}
+      } catch (subErr) {
+        logger.error('[estimator] Failed to start subscription:', subErr)
+      }
+
+      // Fallback polling - only used if subscription fails to deliver
+      const pollForSummary = async (attempts = 0) => {
+        // Stop polling if AI data has already been received
+        if (aiDataReceived) {
+          logger.debug('[estimator] Polling stopped - AI data already received')
+          return
+        }
+
+        if (attempts >= 6) {
+          // Previously this silently showed the summary, so the locally
+          // computed baseline was indistinguishable from a real analysis.
+          logger.warn('[estimator] AI analysis did not arrive; showing preliminary estimate')
+          setAiStatus('degraded')
+          window.dataLayer?.push({
+            event: 'estimator_ai_timeout',
+            env,
+            app_env: env,
+            tracking_id: projectId,
+          })
+          setStep('summary')
+          return
+        }
+
+        try {
+          logger.debug('[estimator] Fetching project details, attempt', attempts + 1)
+          const updatedProject = await client.graphql({
+            query: getProject,
+            variables: { id: projectId },
+          })
+
+          const project = updatedProject.data.getProject
+
+          // Check multiple fields since AI_estimatedCost might remain null
+          if (applyProjectToState(project)) {
+            logger.debug('[estimator] AI data received via polling')
+            aiDataReceived = true
+            setAiStatus('ready')
+            setStep('summary')
+            return
+          } else {
+            logger.debug('[estimator] AI data not ready yet (fallback polling), attempt:', attempts + 1)
+            // Only schedule next poll if data hasn't been received
+            if (!aiDataReceived) {
+              setTimeout(
+                () => pollForSummary(attempts + 1),
+                5000 // 5 second intervals for fallback polling
+              )
+            }
+          }
+        } catch (error) {
+          logger.error('[estimator] Error in fallback polling:', error)
+          // Only schedule next poll if data hasn't been received
+          if (!aiDataReceived) {
+            setTimeout(
+              () => pollForSummary(attempts + 1),
+              5000 // 5 second intervals for fallback polling
+            )
+          }
+        }
+      }
+
+      // Start polling only after 15 seconds if subscription hasn't delivered
+      // This gives the subscription time to work (it's the preferred method)
+      setTimeout(() => {
+        if (!aiDataReceived) {
+          logger.debug('[estimator] subscription silent after 15s, starting fallback polling')
+          pollForSummary()
+        } else {
+          logger.debug('[estimator] No polling needed - subscription already delivered data')
+        }
+      }, 15000)
+    } catch (e: any) {
+      logger.error('[estimator] Error creating project:', e)
+      // Stay on the infrastructure step with the answers intact rather than
+      // dropping the visitor into an empty summary.
+      setAiStatus('error')
+      window.dataLayer?.push({ event: 'estimator_ai_error', env, app_env: env })
+      setStep('infrastructure')
+      toast.error(e.message || 'We could not create your estimate. Please try again.', TOAST_OPTIONS)
+    }
+  }, [formState, step, currentEstimate.cost, autoSelections, applyProjectToState])
+
+  const advanceTo = useCallback((next: StepType) => {
+    if ((WIZARD_STEPS as readonly string[]).includes(next)) {
+      setMaxStepReached((prev) =>
+        WIZARD_STEPS.indexOf(next as WizardStep) > WIZARD_STEPS.indexOf(prev) ? (next as WizardStep) : prev
+      )
+    }
+    setStep(next)
+  }, [])
+
+  /**
+   * Jump back to an already-completed step to change an answer.
+   *
+   * Answers are preserved, so re-submitting creates a NEW project rather than
+   * editing the old one: the schema grants anonymous visitors create and read,
+   * not update (HN-11), and a shared link should keep showing the estimate it
+   * was created for.
+   */
+  const handleJumpToStep = useCallback(
+    (target: WizardStep) => {
+      if (WIZARD_STEPS.indexOf(target) > WIZARD_STEPS.indexOf(maxStepReached)) return
+      window.dataLayer?.push({ event: 'estimator_step_revisited', env, app_env: env, step: target })
+      setStep(target)
+    },
+    [maxStepReached]
+  )
+
+  const handleNext = useCallback(() => {
+    logger.debug('[estimator] Next clicked on step:', step)
+    switch (step) {
+      case 'start':
+        advanceTo('scope')
+        break
+      case 'scope':
+        if (!formState.scope.trim()) {
+          failStep('scope', 'Please describe your project so we can estimate it.')
+          return
+        }
+        advanceTo('timeline')
+        break
+      case 'timeline':
+        if (!autoSelections.timeline && !formState.timeline.trim()) {
+          failStep('timeline', 'Tell us your target timeline, or tick Recommend for me.')
+          return
+        }
+        advanceTo('team')
+        break
+      case 'team':
+        if (!autoSelections.team && !formState.selectedTeam) {
+          failStep('team', 'Choose a team size, or tick Recommend for me.')
+          return
+        }
+        advanceTo('infrastructure')
+        break
+      case 'infrastructure':
+        if (!autoSelections.infrastructure && !formState.infrastructure) {
+          failStep('infrastructure', 'Choose an infrastructure option, or tick Recommend for me.')
+          return
+        }
+        handleProjectSubmit()
+        break
+    }
+  }, [step, handleProjectSubmit, autoSelections, formState, failStep, advanceTo, applyProjectToState])
+
+  const handleBack = useCallback(() => {
+    logger.debug('[estimator] Back clicked on step:', step)
+    switch (step) {
+      case 'scope':
+        setStep('start')
+        break
+      case 'timeline':
+        setStep('scope')
+        break
+      case 'team':
+        setStep('timeline')
+        break
+      case 'infrastructure':
+        setStep('team')
+        break
+      case 'loading':
+        setStep('infrastructure')
+        break
+      case 'summary':
+        setStep('infrastructure')
+        break
+    }
+  }, [step])
+
+  const handleRestart = useCallback(() => {
+    logger.debug('[estimator] Restarting estimator')
+    if (subscriptionRef.current) {
+      try {
+        subscriptionRef.current.unsubscribe()
+      } catch (error) {
+        logger.error('[estimator] Failed to unsubscribe during restart:', error)
+      }
+      subscriptionRef.current = null
+    }
+    setLastProjectId(null)
+    setStep('start')
+    setFormState(createInitialFormState())
+    setAutoSelections({
+      timeline: false,
+      team: false,
+      infrastructure: false,
+    })
+    setStepErrors({})
+    setAiStatus('pending')
+    setRestoreFailed(false)
+    setMaxStepReached('scope')
+    setAiEstimate(null)
+    setAiTimeline(null)
+    setAiPhasesJson(null)
+    setAiTeamSize(null)
+    setAiImprovedScope(null)
+    setAiCostAnalysis(null)
+    setAiTimelineValidationRaw(null)
+    setAiInfrastructure(null)
+    setAiInfrastructureRecommendations(null)
+    setAiRiskAssessment(null)
+  }, [])
+
+  /**
+   * Re-runs the estimate with the same answers after a timeout or failure.
+   * Creates a NEW project rather than mutating the old one: the schema grants
+   * anonymous visitors create and read, not update (see HN-11).
+   */
+  const handleRetryEstimate = useCallback(() => {
+    setAiStatus('pending')
+    setStep('infrastructure')
+    window.dataLayer?.push({ event: 'estimator_retry', env, app_env: env })
+    handleProjectSubmit()
+  }, [handleProjectSubmit])
+
+  const handleStartEstimate = useCallback(() => {
+    logger.debug('[estimator] Starting estimate')
+    window.dataLayer?.push({ event: 'estimator_started', env, app_env: env })
+    setStep('scope')
+  }, [])
+
+  const handleContactFormBlur = useCallback(
+    (fieldName: string, value: string) => {
+      if (value.trim() && !contactFormTrackedFields.current.has(fieldName) && lastProjectId) {
+        contactFormTrackedFields.current.add(fieldName)
+        window.dataLayer?.push({
+          event: 'contact_form_input',
+          env,
+          app_env: env,
+          tracking_id: lastProjectId,
+        })
+      }
+    },
+    [lastProjectId]
+  )
+
+  const handleContactSubmit = useCallback(async () => {
+    logger.debug('[estimator] Submitting contact information:', {
+      firstName: formState.firstName,
+      lastName: formState.lastName,
+      emailAddress: formState.emailAddress,
+      phoneNumber: formState.phoneNumber,
+    })
+
+    // Validate required fields
+    if (!formState.firstName || !formState.lastName || !formState.emailAddress) {
+      toast.error('Please provide your first name, last name, and email address.', TOAST_OPTIONS)
+      return
+    }
+
+    // Validate email format (must have @ and TLD)
+    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/
+    if (!emailRegex.test(formState.emailAddress)) {
+      toast.error('Please enter a valid email address (e.g., name@example.com).', TOAST_OPTIONS)
+      return
+    }
+
+    try {
+      // Track contact form submission attempt
+      if (lastProjectId) {
+        window.dataLayer?.push({
+          event: 'contact_form_submitted',
+          env,
+          app_env: env,
+          tracking_id: lastProjectId,
+        })
+      }
+
+      // Pull UTM + tracking_id from the same localStorage location `_app.tsx` writes.
+      const utmData: {
+        tracking_id?: string | null
+        utm_source?: string | null
+        utm_medium?: string | null
+        utm_campaign?: string | null
+        utm_content?: string | null
+        utm_term?: string | null
+      } = (() => {
+        try {
+          const raw = typeof window !== 'undefined' ? localStorage.getItem('hypernova_tracking') : null
+          return raw ? JSON.parse(raw) : {}
+        } catch {
+          return {}
+        }
+      })()
+
+      // Call HubSpot API endpoint
+      // Note: next.config.mjs sets `trailingSlash: true`, so use a trailing slash to avoid a redirect.
+      const hubspotResponse = await fetch('/api/create-hubspot-lead/', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          firstName: formState.firstName,
+          lastName: formState.lastName,
+          email: formState.emailAddress,
+          phoneNumber: formState.phoneNumber?.trim() || undefined,
+          message: formState.message?.trim() || undefined,
+          environment: env,
+          // HubSpot custom properties
+          estimator_completed: true,
+          tracking_id_uuid: utmData.tracking_id || lastProjectId || undefined,
+          utm_source: utmData.utm_source || undefined,
+          utm_medium: utmData.utm_medium || undefined,
+          utm_campaign: utmData.utm_campaign || undefined,
+          utm_content: utmData.utm_content || undefined,
+          utm_term: utmData.utm_term || undefined,
+          // Estimator metadata (safe to pass even if API currently ignores it)
+          scope: formState.scope,
+        }),
+      })
+
+      const hubspotData = await hubspotResponse.json()
+
+      if (!hubspotResponse.ok) {
+        throw new Error(hubspotData.details || hubspotData.error || 'Failed to submit to HubSpot')
+      }
+
+      // Also create lead in local database (optional - don't fail the submission if this errors)
+      try {
+        const leadInput: any = {
+          firstName: formState.firstName,
+          lastName: formState.lastName,
+          email: formState.emailAddress,
+          phoneNumber: formState.phoneNumber?.trim() || 'unknown',
+          description:
+            formState.message ||
+            `Project Estimator: ${formState.scope.substring(0, 100)}${formState.scope.length > 100 ? '...' : ''}`,
+          environment: env,
+        }
+
+        await client.graphql({
+          query: createLead,
+          variables: {
+            input: leadInput,
+          },
+        })
+      } catch (dbError) {
+        // Log but don't fail if local DB save fails - HubSpot is the primary system
+        // HubSpot is the system of record for leads; the DynamoDB write is a
+        // secondary copy, so this is a warning rather than a failure.
+        logger.warn('[estimator] secondary lead write failed', describeError(dbError))
+      }
+
+      logger.debug('[estimator] lead created in HubSpot')
+
+      // Remember who this is so /book-a-meeting can prefill the scheduler.
+      // Same-origin, first-party, and only what the visitor just typed into a
+      // form on this site.
+      try {
+        localStorage.setItem(
+          'hypernova_contact',
+          JSON.stringify({
+            firstName: formState.firstName,
+            lastName: formState.lastName,
+            email: formState.emailAddress,
+          })
+        )
+      } catch {
+        // Storage disabled: prefill is a convenience, not a requirement.
+      }
+
+      // Send the copy only after the lead is recorded. The lead is the thing
+      // that matters commercially; the email is a courtesy, and it must never
+      // be the reason a submission appears to fail. The endpoint swallows its
+      // own transport errors for the same reason.
+      if (emailCopy && lastProjectId) {
+        fetch('/api/email-estimate/', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            estimateId: lastProjectId,
+            email: formState.emailAddress,
+            firstName: formState.firstName,
+            renderedAt: estimatorRenderedAt.current,
+          }),
+        })
+          .then(() => {
+            window.dataLayer?.push({ event: 'estimate_emailed', env, app_env: env, tracking_id: lastProjectId })
+          })
+          .catch((error) => logger.warn('[estimator] estimate email request failed', describeError(error)))
+      }
+
+      toast.success("Thank you! We'll be in touch soon.", TOAST_OPTIONS)
+    } catch (error: any) {
+      logger.error('[estimator] Error creating lead:', error)
+      toast.error(
+        error.message || 'An error occurred while submitting your information. Please try again.',
+        TOAST_OPTIONS
+      )
+    }
+  }, [formState, lastProjectId, emailCopy])
+
+  // Track form progress with GA4 events
+  useEffect(() => {
+    switch (step) {
+      case 'scope':
+        window.dataLayer?.push({
+          event: 'estimator_progress',
+          env,
+          app_env: env,
+          step: 1,
+          total_steps: 4,
+          page_name: 'scope_of_work',
+        })
+        break
+      case 'timeline':
+        window.dataLayer?.push({
+          event: 'estimator_progress',
+          env,
+          app_env: env,
+          step: 2,
+          total_steps: 4,
+          page_name: 'timeline',
+        })
+        break
+      case 'team':
+        window.dataLayer?.push({
+          event: 'estimator_progress',
+          env,
+          app_env: env,
+          step: 3,
+          total_steps: 4,
+          page_name: 'team_size',
+        })
+        break
+      case 'infrastructure':
+        window.dataLayer?.push({
+          event: 'estimator_progress',
+          env,
+          app_env: env,
+          step: 4,
+          total_steps: 4,
+          page_name: 'infrastructure',
+        })
+        break
+      case 'summary':
+        window.dataLayer?.push({
+          event: 'estimator_completed',
+          env,
+          app_env: env,
+          step: 'complete',
+          tracking_id: lastProjectId,
+        })
+        break
+    }
+  }, [step, lastProjectId])
+
+  useEffect(() => {
+    return () => {
+      if (subscriptionRef.current) {
+        try {
+          subscriptionRef.current.unsubscribe()
+        } catch {}
+      }
+    }
+  }, [])
+
+  // Additional lightweight refresher while on summary until AI estimates arrive
+  useEffect(() => {
+    if (step !== 'summary' || aiEstimate || !lastProjectId) return
+    let attempts = 0
+    let timer: any
+    const tick = async () => {
+      attempts += 1
+      try {
+        const res = await client.graphql({
+          query: getProject,
+          variables: { id: lastProjectId },
+        })
+        const p = (res as GraphQLResponse)?.data?.getProject
+        const hasLateAi = applyProjectToState(p)
+        // The refresher keeps running after a timeout, so a late analysis
+        // still upgrades the summary and removes the banner without a reload.
+        if (hasLateAi) setAiStatus('ready')
+      } catch {}
+      if (!aiEstimate && attempts < 30 && step === 'summary') {
+        timer = setTimeout(tick, 1000)
+      }
+    }
+    timer = setTimeout(tick, 500)
+    return () => clearTimeout(timer)
+  }, [step, aiEstimate, lastProjectId, applyProjectToState])
+
+  /**
+   * HN-01: restore a finished estimate from /tools/ai-project-estimator/?estimate=<id>
+   *
+   * The id is a capability token -- anyone holding the link can read that
+   * estimate. That is deliberate: the visitor needs to forward it to whoever
+   * approves the budget, and the content is their own project description.
+   * It is also why the schema grants `get` but never `list` (HN-11): a link
+   * you were given is fine, enumerating everyone else's is not.
+   */
+  useEffect(() => {
+    if (!router.isReady) return
+
+    const raw = router.query.estimate
+    const id = Array.isArray(raw) ? raw[0] : raw
+    if (!id) return
+
+    // Do not re-restore the estimate we just created ourselves.
+    if (id === lastProjectId) return
+
+    // Cheap shape check before spending a network call on obvious rubbish.
+    if (!/^[a-zA-Z0-9-]{8,64}$/.test(id)) {
+      setRestoreFailed(true)
+      setStep('summary')
+      return
+    }
+
+    let cancelled = false
+    setStep('loading')
+
+    client
+      .graphql({ query: getProject, variables: { id } })
+      .then((res) => {
+        if (cancelled) return
+        const project = (res as GraphQLResponse)?.data?.getProject
+        if (!project) {
+          setRestoreFailed(true)
+          setStep('summary')
+          return
+        }
+        setLastProjectId(id)
+        setAiStatus(applyProjectToState(project) ? 'ready' : 'degraded')
+        setStep('summary')
+        window.dataLayer?.push({ event: 'estimate_resumed', env, app_env: env, tracking_id: id })
+      })
+      .catch((error) => {
+        if (cancelled) return
+        logger.warn('[estimator] could not restore estimate', describeError(error))
+        setRestoreFailed(true)
+        setStep('summary')
+      })
+
+    return () => {
+      cancelled = true
+    }
+    // lastProjectId is deliberately omitted: including it would re-run this
+    // effect the moment we set it, immediately after a normal submission.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [router.isReady, router.query.estimate, applyProjectToState])
+
+  /**
+   * Puts the estimate id in the URL once the summary is reachable, using a
+   * shallow replace so React state survives. Without this the link only
+   * exists if the visitor thinks to press a button.
+   */
+  useEffect(() => {
+    if (step !== 'summary' || !lastProjectId || !router.isReady) return
+    if (router.query.estimate === lastProjectId) return
+
+    router.replace({ pathname: router.pathname, query: { ...router.query, estimate: lastProjectId } }, undefined, {
+      shallow: true,
+    })
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [step, lastProjectId, router.isReady])
+
+  const handleCopyLink = useCallback(async () => {
+    if (!lastProjectId) return
+    const url = `${window.location.origin}${window.location.pathname}?estimate=${lastProjectId}`
+
+    try {
+      await navigator.clipboard.writeText(url)
+      toast.success('Link copied. Anyone with it can view this estimate.', TOAST_OPTIONS)
+      window.dataLayer?.push({ event: 'estimate_link_copied', env, app_env: env, tracking_id: lastProjectId })
+    } catch {
+      // clipboard requires a secure context and a user gesture; both can fail
+      // in an embedded browser. Show the URL so it can be copied by hand.
+      toast.info(url, { ...TOAST_OPTIONS, autoClose: 15000 })
+    }
+  }, [lastProjectId])
+
+  const cleanedTimelineValidation = useMemo(
+    () => (aiTimelineValidationRaw ? removePhasesJsonFromText(aiTimelineValidationRaw) || null : null),
+    [aiTimelineValidationRaw]
+  )
+
+  const timelineSummaryFromAI = useMemo(
+    () => extractTimelineSummary(cleanedTimelineValidation),
+    [cleanedTimelineValidation]
+  )
+
+  const timelineInsightFromPhases = useMemo(() => {
+    if (!aiPhasesJson) return null
+    try {
+      const parsed = JSON.parse(aiPhasesJson)
+      if (parsed?.totalDays) {
+        const totalDays = Number(parsed.totalDays)
+        if (Number.isFinite(totalDays) && totalDays > 0) {
+          const months = totalDays / 30
+          const display = totalDays >= 60 ? `${Math.round(totalDays / 30)} months` : `${totalDays} days`
+          return {
+            display,
+            monthsRange: { min: months, max: months },
+          }
+        }
+      }
+    } catch {}
+    return null
+  }, [aiPhasesJson])
+
+  const displayedCost = useMemo(() => {
+    if (aiEstimate?.trim()) return aiEstimate.trim()
+    const extracted = extractCostSummary(aiCostAnalysis)
+    if (extracted) return extracted
+    return currentEstimate.cost
+  }, [aiEstimate, aiCostAnalysis, currentEstimate.cost])
+
+  const timelineRangeFromSummary = useMemo(
+    () => (timelineSummaryFromAI ? getTimelineRangeInMonths(timelineSummaryFromAI) : null),
+    [timelineSummaryFromAI]
+  )
+
+  const timelineRangeFromPhases = useMemo(
+    () => timelineInsightFromPhases?.monthsRange ?? null,
+    [timelineInsightFromPhases]
+  )
+
+  const timelineRangeFromAiTimeline = useMemo(
+    () => (aiTimeline ? getTimelineRangeInMonths(aiTimeline) : null),
+    [aiTimeline]
+  )
+
+  const timelineRangeForHours = timelineRangeFromSummary || timelineRangeFromPhases || timelineRangeFromAiTimeline
+
+  const timelineLabelFromPhases = useMemo(() => formatMonthsRange(timelineRangeFromPhases), [timelineRangeFromPhases])
+
+  const timelineLabelFromSummaryRange = useMemo(
+    () => formatMonthsRange(timelineRangeFromSummary),
+    [timelineRangeFromSummary]
+  )
+
+  const timelineLabelFromAiTimeline = useMemo(
+    () => formatMonthsRange(timelineRangeFromAiTimeline),
+    [timelineRangeFromAiTimeline]
+  )
+
+  const displayedTimeline = useMemo(() => {
+    if (timelineLabelFromPhases) return timelineLabelFromPhases
+    if (timelineLabelFromSummaryRange) return timelineLabelFromSummaryRange
+    if (timelineLabelFromAiTimeline) return timelineLabelFromAiTimeline
+    if (timelineInsightFromPhases) return timelineInsightFromPhases.display
+    if (timelineSummaryFromAI) return timelineSummaryFromAI
+    if (aiTimeline?.trim()) return aiTimeline.trim()
+    if (autoSelections.timeline) return "We'll recommend a timeline for you."
+    return formState.timeline || 'TBD'
+  }, [
+    timelineLabelFromPhases,
+    timelineLabelFromSummaryRange,
+    timelineLabelFromAiTimeline,
+    timelineInsightFromPhases,
+    timelineSummaryFromAI,
+    aiTimeline,
+    autoSelections.timeline,
+    formState.timeline,
+  ])
+
+  const displayedHours = useMemo(() => {
+    if (timelineRangeForHours) {
+      const minHours = Math.round(timelineRangeForHours.min * 160)
+      const maxHours = Math.round(timelineRangeForHours.max * 160)
+      if (minHours > 0 && maxHours > 0) {
+        if (Math.abs(maxHours - minHours) >= 50) {
+          return `${minHours.toLocaleString()}-${maxHours.toLocaleString()}`
+        }
+        const avg = Math.round((minHours + maxHours) / 2)
+        return `~${avg.toLocaleString()}`
+      }
+    }
+    return currentEstimate.hours
+  }, [timelineRangeForHours, currentEstimate.hours])
+
+  const teamDetailsFromAnalysis = useMemo(
+    () => extractTeamCompositionDetails(aiCostAnalysis) || extractTeamSummary(aiCostAnalysis),
+    [aiCostAnalysis]
+  )
+
+  const displayedTeamSize = useMemo(() => {
+    if (aiTeamSize?.trim()) return aiTeamSize.trim()
+    if (teamDetailsFromAnalysis) return teamDetailsFromAnalysis
+    if (formState.selectedTeam) return formatTeamSize(formState.selectedTeam)
+    if (autoSelections.team) return "We'll recommend a team for you."
+    return 'TBD'
+  }, [aiTeamSize, teamDetailsFromAnalysis, formState.selectedTeam, autoSelections.team])
+
+  const displayedInfrastructure = useMemo(() => {
+    if (aiInfrastructure?.trim()) return aiInfrastructure.trim()
+    const parsed = extractInfrastructureSummary(aiInfrastructureRecommendations)
+    if (parsed) return parsed
+    if (formState.infrastructure) return formatInfrastructure(formState.infrastructure)
+    if (autoSelections.infrastructure) return "We'll recommend the right infrastructure."
+    return 'TBD'
+  }, [aiInfrastructure, aiInfrastructureRecommendations, formState.infrastructure, autoSelections.infrastructure])
+
+  /**
+   * HN-03: build and download the estimate as a PDF.
+   *
+   * jsPDF is imported on demand so its ~350KB never lands in the initial
+   * bundle -- most visitors never reach the summary, and none of them should
+   * pay for a library they will not use.
+   */
+  const handleDownloadPdf = useCallback(async () => {
+    if (!lastProjectId || isPreparingPdf) return
+    setIsPreparingPdf(true)
+
+    try {
+      const [{ jsPDF }, { drawEstimatePdf, buildPdfFilename }] = await Promise.all([
+        import('jspdf'),
+        import('../lib/estimatePdf'),
+      ])
+
+      let phases: { label: string; days: number }[] | undefined
+      if (aiPhasesJson) {
+        try {
+          phases = JSON.parse(aiPhasesJson)?.phases
+        } catch {
+          // Malformed phase JSON just means no chart, not a failed download.
+        }
+      }
+
+      const doc = new jsPDF({ unit: 'mm', format: 'a4' })
+      drawEstimatePdf(doc as never, {
+        id: lastProjectId,
+        cost: displayedCost,
+        timeline: displayedTimeline,
+        hours: displayedHours,
+        team: displayedTeamSize,
+        infrastructure: displayedInfrastructure,
+        scope: aiImprovedScope || formState.scope,
+        risks: aiRiskAssessment,
+        phases,
+        isPreliminary: aiStatus !== 'ready',
+      })
+      doc.save(buildPdfFilename(lastProjectId))
+
+      window.dataLayer?.push({ event: 'estimate_pdf_downloaded', env, app_env: env, tracking_id: lastProjectId })
+    } catch (error) {
+      logger.error('[estimator] pdf generation failed', describeError(error))
+      toast.error('We could not build the PDF. The estimate link still works.', TOAST_OPTIONS)
+    } finally {
+      setIsPreparingPdf(false)
+    }
+  }, [
+    lastProjectId,
+    isPreparingPdf,
+    aiPhasesJson,
+    displayedCost,
+    displayedTimeline,
+    displayedHours,
+    displayedTeamSize,
+    displayedInfrastructure,
+    aiImprovedScope,
+    formState.scope,
+    aiRiskAssessment,
+    aiStatus,
+  ])
+
+  const ganttChartContent = useMemo(() => {
+    if (step !== 'summary') return null
+    if (!aiPhasesJson && !aiTimeline) return null
+    return <GanttChart aiTimelineText={aiTimeline || undefined} phasesJson={aiPhasesJson || undefined} />
+  }, [step, aiTimeline, aiPhasesJson])
+
+  return (
+    <>
+      <PlasmicProjectEstimator
+        root={{
+          ref,
+          // Wrapping the root keeps this independent of the internal node
+          // names in the generated component, so a design change cannot
+          // silently remove the one thing telling a visitor these numbers
+          // are provisional.
+          wrap: (node: React.ReactNode) => (
+            <>
+              {restoreFailed ? <EstimateNotFound onStartOver={handleRestart} /> : null}
+              {step === 'summary' || aiStatus === 'error' ? (
+                <EstimateStatusBanner status={aiStatus} onRetry={handleRetryEstimate} />
+              ) : null}
+              {step === 'summary' && lastProjectId && !restoreFailed ? (
+                <EstimateShareBar
+                  onCopyLink={handleCopyLink}
+                  onDownloadPdf={handleDownloadPdf}
+                  isPreparingPdf={isPreparingPdf}
+                />
+              ) : null}
+              {(WIZARD_STEPS as readonly string[]).includes(step) ? (
+                <EstimatorProgress
+                  current={step as WizardStep}
+                  maxReached={maxStepReached}
+                  onJumpToStep={handleJumpToStep}
+                />
+              ) : null}
+              {node}
+            </>
+          ),
+        }}
+        {...props}
+        step={step}
+        aiImprovedScope={aiImprovedScope || undefined}
+        aiCostAnalysis={aiCostAnalysis || undefined}
+        aiTimelineValidation={cleanedTimelineValidation || undefined}
+        aiInfrastructureRecommendations={aiInfrastructureRecommendations || undefined}
+        aiRiskAssessment={aiRiskAssessment || undefined}
+        scopeOfWorkTextInput={{
+          props: {
+            value: formState.scope,
+            onChange: (e: FormEvent) => updateFormField('scope', e.target.value),
+            'aria-invalid': stepErrors.scope ? true : undefined,
+            'aria-describedby': stepErrors.scope ? 'estimator-error-scope' : undefined,
+          },
+          // `wrap` attaches the message to a designed node without editing the
+          // generated Plasmic component -- the same technique the homepage
+          // uses to inject the 3D astronaut around the hero.
+          wrap: (node: React.ReactNode) => (
+            <>
+              {node}
+              <FieldError id='estimator-error-scope' message={stepErrors.scope} />
+            </>
+          ),
+        }}
+        timelineTextInput={{
+          props: {
+            value: formState.timeline,
+            onChange: (e: FormEvent) => updateFormField('timeline', e.target.value),
+            disabled: autoSelections.timeline,
+            'aria-invalid': stepErrors.timeline ? true : undefined,
+            'aria-describedby': stepErrors.timeline ? 'estimator-error-timeline' : undefined,
+          },
+          wrap: (node: React.ReactNode) => (
+            <>
+              {node}
+              <FieldError id='estimator-error-timeline' message={stepErrors.timeline} />
+            </>
+          ),
+        }}
+        checkbox={{
+          props: {
+            isSelected: autoSelections.timeline,
+            onChange: (checked: boolean) => handleRecommendationToggle('timeline', checked),
+          },
+        }}
+        _1Developer={{
+          props: {
+            selected: formState.selectedTeam === '1Developer',
+            onClick: () => {
+              if (autoSelections.team) {
+                handleRecommendationToggle('team', false)
+              }
+              updateFormField('selectedTeam', '1Developer')
+            },
+            'aria-disabled': autoSelections.team || undefined,
+          },
+        }}
+        _2Developers={{
+          props: {
+            selected: formState.selectedTeam === '2Developers',
+            onClick: () => {
+              if (autoSelections.team) {
+                handleRecommendationToggle('team', false)
+              }
+              updateFormField('selectedTeam', '2Developers')
+            },
+            'aria-disabled': autoSelections.team || undefined,
+          },
+        }}
+        _2Developers1Designer={{
+          props: {
+            selected: formState.selectedTeam === '2Developers1Designer',
+            onClick: () => {
+              if (autoSelections.team) {
+                handleRecommendationToggle('team', false)
+              }
+              updateFormField('selectedTeam', '2Developers1Designer')
+            },
+            'aria-disabled': autoSelections.team || undefined,
+          },
+        }}
+        _4Developers1Designer={{
+          props: {
+            selected: formState.selectedTeam === '4Developers1Designer',
+            onClick: () => {
+              if (autoSelections.team) {
+                handleRecommendationToggle('team', false)
+              }
+              updateFormField('selectedTeam', '4Developers1Designer')
+            },
+            'aria-disabled': autoSelections.team || undefined,
+          },
+        }}
+        teamCheckbox={{
+          props: {
+            isSelected: autoSelections.team,
+            onChange: (checked: boolean) => handleRecommendationToggle('team', checked),
+          },
+        }}
+        staticVm={{
+          props: {
+            selected: formState.infrastructure === 'staticVm',
+            onClick: () => {
+              if (autoSelections.infrastructure) {
+                handleRecommendationToggle('infrastructure', false)
+              }
+              updateFormField('infrastructure', 'staticVm')
+            },
+            'aria-disabled': autoSelections.infrastructure || undefined,
+          },
+        }}
+        awsEphemeral={{
+          props: {
+            selected: formState.infrastructure === 'awsEphemeral',
+            onClick: () => {
+              if (autoSelections.infrastructure) {
+                handleRecommendationToggle('infrastructure', false)
+              }
+              updateFormField('infrastructure', 'awsEphemeral')
+            },
+            'aria-disabled': autoSelections.infrastructure || undefined,
+          },
+        }}
+        kubernetes={{
+          props: {
+            selected: formState.infrastructure === 'kubernetes',
+            onClick: () => {
+              if (autoSelections.infrastructure) {
+                handleRecommendationToggle('infrastructure', false)
+              }
+              updateFormField('infrastructure', 'kubernetes')
+            },
+            'aria-disabled': autoSelections.infrastructure || undefined,
+          },
+        }}
+        infrastructureCheckbox={{
+          props: {
+            isSelected: autoSelections.infrastructure,
+            onChange: (checked: boolean) => handleRecommendationToggle('infrastructure', checked),
+          },
+        }}
+        startEstimateButton={{
+          props: {
+            onClick: handleStartEstimate,
+          },
+        }}
+        nextButton={{
+          props: {
+            onClick: handleNext,
+          },
+          // The team and infrastructure steps are card grids with no single
+          // input to describe, so their message goes beside the button the
+          // visitor just pressed -- which is where their attention already is.
+          wrap: (node: React.ReactNode) => (
+            <>
+              {node}
+              <FieldError id='estimator-error-selection' message={stepErrors.team || stepErrors.infrastructure} />
+            </>
+          ),
+        }}
+        backButton={{
+          props: {
+            onClick: handleBack,
+          },
+        }}
+        restartButton={{
+          props: {
+            onClick: handleRestart,
+          },
+        }}
+        getStartedButton={{
+          props: {
+            onClick: handleContactSubmit,
+          },
+          wrap: (node: React.ReactNode) => (
+            <>
+              <label
+                style={{
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: 8,
+                  margin: '12px 0',
+                  fontSize: 14,
+                  color: 'rgba(255,255,255,0.8)',
+                  cursor: 'pointer',
+                }}>
+                <input type='checkbox' checked={emailCopy} onChange={(e) => setEmailCopy(e.target.checked)} />
+                Email me a copy of this estimate
+              </label>
+              {node}
+            </>
+          ),
+        }}
+        estimatedTimeline={displayedTimeline}
+        estimatedHours={displayedHours}
+        estimatedTeam={displayedTeamSize}
+        estimatedCost={displayedCost}
+        estimatedArchitecture={displayedInfrastructure}
+        scope={formState.scope || 'TBD'}
+        firstName={{
+          props: {
+            value: formState.firstName,
+            onChange: (e: any) => updateFormField('firstName', e.target.value),
+            onBlur: (e: any) => handleContactFormBlur('firstName', e.target.value),
+          },
+        }}
+        lastName={{
+          props: {
+            value: formState.lastName,
+            onChange: (e: any) => updateFormField('lastName', e.target.value),
+            onBlur: (e: any) => handleContactFormBlur('lastName', e.target.value),
+          },
+        }}
+        emailAddress={{
+          props: {
+            value: formState.emailAddress,
+            onChange: (e: any) => updateFormField('emailAddress', e.target.value),
+            onBlur: (e: any) => handleContactFormBlur('emailAddress', e.target.value),
+          },
+        }}
+        phoneNumber={{
+          props: {
+            value: formState.phoneNumber,
+            onChange: (e: any) => updateFormField('phoneNumber', e.target.value),
+            onBlur: (e: any) => handleContactFormBlur('phoneNumber', e.target.value),
+          },
+        }}
+        message={{
+          props: {
+            value: formState.message,
+            onChange: (e: any) => updateFormField('message', e.target.value),
+            onBlur: (e: any) => handleContactFormBlur('message', e.target.value),
+          },
+        }}
+        ganttChart={{
+          children: ganttChartContent,
+        }}
+      />
+      <ToastContainer />
+    </>
+  )
+}
+
+const ProjectEstimator = forwardRef(ProjectEstimator_)
+export default ProjectEstimator
