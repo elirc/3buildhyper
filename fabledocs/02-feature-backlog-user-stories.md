@@ -1,5 +1,17 @@
 # HyperNova Inc — Proposed Feature Backlog (20 user stories)
 
+> **Status note (2026-10-06).** Written as a proposal, since substantially
+> implemented in this tree. Stories with verifiable artifacts today:
+> HN-02 (`lib/mailer.ts`, `pages/api/email-estimate.ts`), HN-03
+> (`lib/estimatePdf.ts`), HN-05/07 (`lib/contactValidation.ts`), HN-06
+> (`lib/aiTextParsing.ts`), HN-08 (`lib/spamGuard.ts`), HN-09
+> (`lib/rateLimiter.ts`), HN-12 (`lib/serverEnv.ts`, `.env.example`),
+> HN-14 (`lib/consent.ts`), HN-15 (`lib/seo.ts`, `pages/sitemap.xml.tsx`),
+> HN-16 (`pages/404.tsx`), HN-17 (`lib/readingTime.ts`), HN-19 (11 suites
+> under `__tests__/`, jsdom config), HN-20 (`lib/logger.ts`) — each module
+> has a matching test. Before picking up a story, check the tree against
+> its acceptance criteria rather than assuming it is still open.
+
 > Companion to [01-app-architecture-guide.md](./01-app-architecture-guide.md). Read that first —
 > every story below assumes you know what Plasmic wrappers are and where the estimator's state
 > machine lives.
